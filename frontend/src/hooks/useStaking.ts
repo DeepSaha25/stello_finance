@@ -88,8 +88,11 @@ export function useStaking(): UseStakingReturn {
       // This bypasses any backend env-var misconfiguration and is always authoritative.
       let sxlmBalance = 0;
       try {
+        console.log('[sXLM] Starting balance fetch for', publicKey);
+        console.log('[sXLM] RPC:', NETWORK.sorobanRpcUrl, '| Contract:', CONTRACTS.sxlmToken);
         const soroban = new SorobanRpc.Server(NETWORK.sorobanRpcUrl);
         const account = await soroban.getAccount(SIMULATION_SOURCE);
+        console.log('[sXLM] Got simulation source account, seq:', account.sequenceNumber());
         const tx = new TransactionBuilder(account, {
           fee: BASE_FEE,
           networkPassphrase: NETWORK.networkPassphrase,
@@ -100,12 +103,20 @@ export function useStaking(): UseStakingReturn {
           .setTimeout(30)
           .build();
         const sim = await soroban.simulateTransaction(tx);
-        if (SorobanRpc.Api.isSimulationSuccess(sim) && sim.result) {
-          sxlmBalance = Number(scValToNative(sim.result.retval)) / 1e7;
+        console.log('[sXLM] Simulation result:', JSON.stringify(sim).slice(0, 300));
+        const isSuccess = SorobanRpc.Api.isSimulationSuccess(sim);
+        console.log('[sXLM] isSuccess:', isSuccess, '| has result:', !!(sim as { result?: unknown }).result);
+        if (isSuccess && (sim as { result?: { retval: unknown } }).result) {
+          const raw = scValToNative((sim as { result: { retval: Parameters<typeof scValToNative>[0] } }).result.retval);
+          console.log('[sXLM] Raw balance value:', raw, typeof raw);
+          sxlmBalance = Number(raw) / 1e7;
+          console.log('[sXLM] sXLM balance:', sxlmBalance);
         }
-      } catch {
+      } catch (sorobanErr) {
+        console.error('[sXLM] Soroban simulation failed:', sorobanErr);
         // Fall back to backend value if Soroban read fails
         sxlmBalance = apiRes?.data?.sxlmBalance ?? 0;
+        console.log('[sXLM] Backend fallback sxlmBalance:', sxlmBalance, '| apiRes:', apiRes?.data);
       }
 
       setBalance({
