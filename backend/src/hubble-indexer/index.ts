@@ -17,6 +17,17 @@
  * Every event write uses `createMany({ skipDuplicates: true })` which relies
  * on the `@@unique([txHash, eventIndex])` constraints in schema.prisma.
  *
+ * Reliability
+ * ───────────
+ * - Individual RPC fetches are retried up to MAX_RETRIES times with
+ *   exponential back-off before propagating an error.
+ * - A configurable inter-page delay (BACKFILL_BATCH_DELAY_MS) prevents the
+ *   backfill loop from overwhelming the RPC endpoint.
+ * - A simple token-bucket rate limiter caps concurrent RPC calls per second
+ *   to avoid 429 responses from shared or public RPC nodes.
+ * - Cursors are flushed to Postgres every CURSOR_FLUSH_EVERY_N_PAGES pages
+ *   during backfill, so a crash mid-backfill only replays the last N pages.
+ *
  * Relation to the legacy EventListenerService
  * ────────────────────────────────────────────
  * The legacy service (`event-listener/index.ts`) continues to run alongside
@@ -37,11 +48,32 @@ const PAGE_LIMIT = 200;
 /** Milliseconds between live-poll ticks. */
 const LIVE_POLL_INTERVAL_MS = 10_000;
 
-/** Milliseconds to wait before retrying after an RPC/network error. */
+/** Base milliseconds to wait before a retry or after an error. */
 const RETRY_DELAY_BASE_MS = 2_000;
 
-/** Maximum number of consecutive errors before the indexer backs off further. */
+/** Maximum number of consecutive live-poll errors before giving up the loop. */
 const MAX_CONSECUTIVE_ERRORS = 5;
+
+/** Maximum number of retries for a single RPC fetch call. */
+const MAX_RETRIES = 3;
+
+/**
+ * Minimum delay between consecutive RPC pages during backfill (ms).
+ * Keeps the indexer from rate-limiting shared/public RPC nodes.
+ */
+const BACKFILL_BATCH_DELAY_MS = 150;
+
+/**
+ * Flush cursors to Postgres every N backfill pages so that a crash mid-backfill
+ * only needs to replay at most N pages worth of events.
+ */
+const CURSOR_FLUSH_EVERY_N_PAGES = 10;
+
+/**
+ * Maximum RPC calls allowed per second (token-bucket rate limiter).
+ * Set conservatively to avoid 429s on public Soroban RPC nodes.
+ */
+const RPC_MAX_CALLS_PER_SECOND = 4;
 
 /** All contract IDs monitored by this indexer. */
 const CONTRACT_IDS = [
@@ -51,6 +83,50 @@ const CONTRACT_IDS = [
   config.contracts.governanceContractId,
   config.contracts.sxlmTokenContractId,
 ].filter(Boolean);
+
+// ─── Simple token-bucket rate limiter ────────────────────────────────────────
+
+/**
+ * A lightweight token-bucket that limits how many times `acquire()` can
+ * resolve per second.  Each call to `acquire()` waits until a token is
+ * available before resolving.
+ */
+class RateLimiter {
+  private tokens: number;
+  private readonly maxTokens: number;
+  private lastRefillMs: number;
+  private queue: Array<() => void> = [];
+
+  constructor(callsPerSecond: number) {
+    this.maxTokens = callsPerSecond;
+    this.tokens = callsPerSecond;
+    this.lastRefillMs = Date.now();
+  }
+
+  async acquire(): Promise<void> {
+    this.refill();
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return;
+    }
+    // No token available — queue the caller and wait.
+    await new Promise<void>((resolve) => this.queue.push(resolve));
+  }
+
+  private refill(): void {
+    const now = Date.now();
+    const elapsed = (now - this.lastRefillMs) / 1_000;
+    const added = elapsed * this.maxTokens;
+    this.tokens = Math.min(this.maxTokens, this.tokens + added);
+    this.lastRefillMs = now;
+
+    // Drain the queue as tokens become available.
+    while (this.tokens >= 1 && this.queue.length > 0) {
+      this.tokens -= 1;
+      this.queue.shift()!();
+    }
+  }
+}
 
 // ─── HubbleIndexer ───────────────────────────────────────────────────────────
 
@@ -66,6 +142,8 @@ export class HubbleIndexer {
   private cursors: Map<string, number> = new Map();
 
   private consecutiveErrors = 0;
+
+  private readonly rateLimiter = new RateLimiter(RPC_MAX_CALLS_PER_SECOND);
 
   constructor(prisma: PrismaClient) {
     this.prisma = prisma;
@@ -130,6 +208,33 @@ export class HubbleIndexer {
     await Promise.all(ops);
   }
 
+  // ─── Retry helper ────────────────────────────────────────────────────────────
+
+  /**
+   * Run `fn` up to MAX_RETRIES times with exponential back-off.
+   * Throws the last error if all attempts fail.
+   */
+  private async withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        if (attempt < MAX_RETRIES) {
+          const delay = RETRY_DELAY_BASE_MS * Math.pow(2, attempt - 1);
+          console.warn(
+            `[HubbleIndexer] ${label} failed (attempt ${attempt}/${MAX_RETRIES}), ` +
+              `retrying in ${delay}ms:`,
+            err
+          );
+          await sleep(delay);
+        }
+      }
+    }
+    throw lastErr;
+  }
+
   // ─── Core indexing logic ────────────────────────────────────────────────────
 
   private async runBackfillThenLive(): Promise<void> {
@@ -137,7 +242,7 @@ export class HubbleIndexer {
     console.log(
       `[HubbleIndexer] Starting backfill from ledger ${this.globalLastLedger}`
     );
-    await this.indexFromLedger(this.globalLastLedger || undefined);
+    await this.indexFromLedger(this.globalLastLedger || undefined, true);
     console.log("[HubbleIndexer] Backfill complete, switching to live mode");
 
     // ── Live polling ──────────────────────────────────────────────────────────
@@ -150,7 +255,7 @@ export class HubbleIndexer {
     if (!this.running) return;
     this.pollTimer = setTimeout(async () => {
       try {
-        await this.indexFromLedger(this.globalLastLedger || undefined);
+        await this.indexFromLedger(this.globalLastLedger || undefined, false);
         this.consecutiveErrors = 0;
       } catch (err) {
         this.consecutiveErrors++;
@@ -162,10 +267,15 @@ export class HubbleIndexer {
             `retrying in ${delay}ms:`,
           err
         );
+        if (this.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          console.error(
+            `[HubbleIndexer] ${MAX_CONSECUTIVE_ERRORS} consecutive errors — ` +
+              `backing off for ${delay}ms before retrying`
+          );
+        }
         await sleep(delay);
       } finally {
         if (this.running) {
-          // Re-schedule with the normal interval after any live tick.
           this.pollTimer = setTimeout(
             () => this.scheduleLivePoll(),
             LIVE_POLL_INTERVAL_MS
@@ -178,18 +288,28 @@ export class HubbleIndexer {
   /**
    * Fetch and persist all events starting from `startLedger` (inclusive),
    * paginating until the chain tip.
+   *
+   * @param startLedger - First ledger to fetch (used on the first page only).
+   * @param isBackfill  - When true, adds inter-page delay and flushes cursors
+   *                      every CURSOR_FLUSH_EVERY_N_PAGES pages.
    */
-  private async indexFromLedger(startLedger?: number): Promise<void> {
+  private async indexFromLedger(
+    startLedger?: number,
+    isBackfill = false
+  ): Promise<void> {
     let cursor: string | undefined;
-
-    // The RPC requires startLedger OR cursor — not both.
-    // Use startLedger for the first page; use cursor for subsequent pages.
     let isFirstPage = true;
+    let pageCount = 0;
+    let totalEvents = 0;
 
     while (this.running) {
-      const response = await this.fetchEventPage(
-        isFirstPage ? startLedger : undefined,
-        isFirstPage ? undefined : cursor
+      const response = await this.withRetry(
+        () =>
+          this.fetchEventPage(
+            isFirstPage ? startLedger : undefined,
+            isFirstPage ? undefined : cursor
+          ),
+        `fetchEventPage(ledger=${startLedger}, cursor=${cursor})`
       );
 
       if (!response.result) {
@@ -205,11 +325,24 @@ export class HubbleIndexer {
 
       if (events.length > 0) {
         await this.processBatch(events);
+        totalEvents += events.length;
       }
 
       // Advance global cursor to the chain tip even if there were no events.
       if (latestLedger > this.globalLastLedger) {
         this.globalLastLedger = latestLedger;
+      }
+
+      pageCount++;
+      isFirstPage = false;
+
+      // Periodic mid-backfill cursor flush to minimise replay on crash.
+      if (isBackfill && pageCount % CURSOR_FLUSH_EVERY_N_PAGES === 0) {
+        await this.flushCursors();
+        console.log(
+          `[HubbleIndexer] Backfill checkpoint: page ${pageCount}, ` +
+            `${totalEvents} events indexed, ledger ${this.globalLastLedger}`
+        );
       }
 
       // No more pages or we've caught up to the tip.
@@ -218,7 +351,18 @@ export class HubbleIndexer {
       }
 
       cursor = nextCursor;
-      isFirstPage = false;
+
+      // Rate-controlled inter-page delay during backfill.
+      if (isBackfill) {
+        await sleep(BACKFILL_BATCH_DELAY_MS);
+      }
+    }
+
+    if (isBackfill && totalEvents > 0) {
+      console.log(
+        `[HubbleIndexer] Backfill finished: ${pageCount} pages, ` +
+          `${totalEvents} events, ledger ${this.globalLastLedger}`
+      );
     }
 
     // Ensure contracts with no events yet still have a cursor row.
@@ -264,6 +408,7 @@ export class HubbleIndexer {
 
   /**
    * Fetch a page of Soroban contract events from the RPC.
+   * Acquires a rate-limiter token before making the network call.
    *
    * @param startLedger - First ledger to include (use for initial/backfill requests).
    * @param cursor      - Pagination cursor from the previous response.
@@ -272,6 +417,9 @@ export class HubbleIndexer {
     startLedger?: number,
     cursor?: string
   ): Promise<GetEventsResponse> {
+    // Respect the per-second call budget before going to the network.
+    await this.rateLimiter.acquire();
+
     const pagination: Record<string, unknown> = { limit: PAGE_LIMIT };
     if (cursor) {
       pagination["cursor"] = cursor;

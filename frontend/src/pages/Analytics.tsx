@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import {
   LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer,
@@ -64,12 +64,31 @@ export default function Analytics() {
   } = useProtocol();
   const {
     utilizationData, revenueSeries, cohortData, liveData,
-    isLoading: analyticsLoading,
+    lastUpdated, isLoading: analyticsLoading, refresh,
   } = useAnalytics(90);
 
   const [range, setRange] = useState<TimeRange>('30d');
+  const [secondsAgo, setSecondsAgo] = useState<number | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   const isLoading = protocolLoading || analyticsLoading;
+
+  // ── "X seconds ago" freshness counter ────────────────────────────────────
+
+  useEffect(() => {
+    if (!lastUpdated) return;
+    const tick = () =>
+      setSecondsAgo(Math.round((Date.now() - lastUpdated.getTime()) / 1000));
+    tick();
+    const id = setInterval(tick, 1_000);
+    return () => clearInterval(id);
+  }, [lastUpdated]);
+
+  const handleRefresh = () => {
+    setRefreshing(true);
+    refresh();
+    setTimeout(() => setRefreshing(false), 600);
+  };
 
   // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -204,7 +223,7 @@ export default function Analytics() {
       {/* Live stats bar */}
       {liveData && (
         <div
-          className="flex flex-wrap gap-5 py-3 px-4 rounded-lg"
+          className="flex flex-wrap items-center gap-5 py-3 px-4 rounded-lg"
           style={{ background: '#0d0d0d', border: '1px solid #1e1e1e' }}
         >
           {liveData.utilization && (
@@ -234,8 +253,47 @@ export default function Analytics() {
               </span>
             </div>
           )}
-          <div className="ml-auto text-[10px]" style={{ color: '#333' }}>
-            {new Date(liveData.timestamp).toLocaleTimeString()}
+          <div className="ml-auto flex items-center gap-3">
+            {secondsAgo !== null && (
+              <span className="text-[10px]" style={{ color: '#333' }}>
+                updated {secondsAgo}s ago
+              </span>
+            )}
+            <button
+              onClick={handleRefresh}
+              disabled={refreshing}
+              title="Refresh now"
+              className="flex items-center justify-center rounded transition-opacity"
+              style={{
+                width: 22,
+                height: 22,
+                background: 'transparent',
+                border: '1px solid #1e1e1e',
+                color: refreshing ? Y : '#525252',
+                cursor: refreshing ? 'default' : 'pointer',
+                opacity: refreshing ? 0.6 : 1,
+              }}
+              onMouseEnter={(e) => { if (!refreshing) e.currentTarget.style.color = '#fff'; }}
+              onMouseLeave={(e) => { if (!refreshing) e.currentTarget.style.color = '#525252'; }}
+            >
+              <svg
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                width="11"
+                height="11"
+                style={{
+                  transformOrigin: 'center',
+                  animation: refreshing ? 'spin 0.6s linear' : 'none',
+                }}
+              >
+                <path d="M13.5 8A5.5 5.5 0 1 1 8 2.5c1.8 0 3.4.87 4.4 2.2" />
+                <polyline points="13.5 2.5 13.5 4.7 11.3 4.7" />
+              </svg>
+            </button>
           </div>
         </div>
       )}

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import axios from '../lib/apiClient';
 import { API_BASE_URL } from '../config/contracts';
 
@@ -51,10 +51,21 @@ interface UseAnalyticsReturn {
   revenueSeries: Record<string, RevenueSeriesPoint[]>;
   cohortData: CohortData[];
   liveData: LiveData | null;
+  /** Timestamp of the last successful live-data fetch. */
+  lastUpdated: Date | null;
   isLoading: boolean;
   error: string | null;
-  refresh: () => Promise<void>;
+  /** Re-fetches both live and historical data immediately. */
+  refresh: () => void;
 }
+
+// ── polling intervals ─────────────────────────────────────────────────────────
+
+/** How often the live ticker is refreshed (fast path). */
+const LIVE_POLL_MS = 15_000;
+
+/** How often the heavier historical series are refreshed (slow path). */
+const HISTORICAL_POLL_MS = 60_000;
 
 // ── mock data generators ──────────────────────────────────────────────────────
 
@@ -114,7 +125,6 @@ function generateMockCohortData(numCohorts = 10, maxOffset = 14): CohortData[] {
       now - (numCohorts - 1 - c + maxOffset + 1) * 24 * 60 * 60 * 1000
     ).toISOString();
     const totalWallets = Math.round(55 + Math.random() * 125);
-    // Newer cohorts have fewer available offsets (they haven't reached day N yet)
     const availableOffsets = Math.min(maxOffset, c);
     const offsets: CohortOffset[] = Array.from({ length: availableOffsets + 1 }, (_, d) => {
       const retentionRate = Math.min(1, Math.max(0.04,
@@ -140,22 +150,42 @@ export function useAnalytics(fromDays = 90): UseAnalyticsReturn {
   const [revenueSeries, setRevenueSeries] = useState<Record<string, RevenueSeriesPoint[]>>({});
   const [cohortData, setCohortData] = useState<CohortData[]>([]);
   const [liveData, setLiveData] = useState<LiveData | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchData = useCallback(async () => {
+  // Track whether historical data has loaded at least once so the loading
+  // skeleton only shows on the very first render.
+  const historicalLoadedRef = useRef(false);
+
+  // ── fetch live ticker (fast path, 15s) ───────────────────────────────────
+
+  const fetchLive = useCallback(async () => {
+    try {
+      const res = await axios.get(`${API_BASE_URL}/api/analytics/live`);
+      if (res.data) {
+        setLiveData(res.data as LiveData);
+        setLastUpdated(new Date());
+      }
+    } catch {
+      // Live fetch failures are silent — the stale value stays visible.
+    }
+  }, []);
+
+  // ── fetch historical series (slow path, 60s) ─────────────────────────────
+
+  const fetchHistorical = useCallback(async () => {
     const from = new Date(Date.now() - fromDays * 24 * 60 * 60 * 1000).toISOString();
     try {
-      const [utilizationRes, revenueRes, cohortsRes, liveRes] = await Promise.allSettled([
+      const [utilizationRes, revenueRes, cohortsRes] = await Promise.allSettled([
         axios.get(`${API_BASE_URL}/api/analytics/utilization?from=${from}`),
         axios.get(`${API_BASE_URL}/api/analytics/revenue?from=${from}&groupBy=source`),
         axios.get(`${API_BASE_URL}/api/analytics/cohorts`),
-        axios.get(`${API_BASE_URL}/api/analytics/live`),
       ]);
 
       if (utilizationRes.status === 'fulfilled' && utilizationRes.value.data?.data?.length > 0) {
         setUtilizationData(utilizationRes.value.data.data);
-      } else {
+      } else if (!historicalLoadedRef.current) {
         setUtilizationData(generateMockUtilization(fromDays));
       }
 
@@ -164,35 +194,61 @@ export function useAnalytics(fromDays = 90): UseAnalyticsReturn {
         : undefined;
       if (series && Object.keys(series).length > 0) {
         setRevenueSeries(series);
-      } else {
+      } else if (!historicalLoadedRef.current) {
         setRevenueSeries(generateMockRevenueSeries(fromDays));
       }
 
       if (cohortsRes.status === 'fulfilled' && cohortsRes.value.data?.cohorts?.length > 0) {
         setCohortData(cohortsRes.value.data.cohorts as CohortData[]);
-      } else {
+      } else if (!historicalLoadedRef.current) {
         setCohortData(generateMockCohortData());
-      }
-
-      if (liveRes.status === 'fulfilled') {
-        setLiveData(liveRes.value.data as LiveData);
       }
 
       setError(null);
     } catch {
-      setError('Failed to fetch analytics data.');
-      setUtilizationData(generateMockUtilization(fromDays));
-      setRevenueSeries(generateMockRevenueSeries(fromDays));
-      setCohortData(generateMockCohortData());
+      if (!historicalLoadedRef.current) {
+        setError('Failed to fetch analytics data.');
+        setUtilizationData(generateMockUtilization(fromDays));
+        setRevenueSeries(generateMockRevenueSeries(fromDays));
+        setCohortData(generateMockCohortData());
+      }
     }
+
+    historicalLoadedRef.current = true;
     setIsLoading(false);
   }, [fromDays]);
 
-  useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 30_000);
-    return () => clearInterval(interval);
-  }, [fetchData]);
+  // ── initial load + separate polling intervals ────────────────────────────
 
-  return { utilizationData, revenueSeries, cohortData, liveData, isLoading, error, refresh: fetchData };
+  useEffect(() => {
+    // Kick off both fetches immediately on mount.
+    fetchHistorical();
+    fetchLive();
+
+    const historicalId = setInterval(fetchHistorical, HISTORICAL_POLL_MS);
+    const liveId = setInterval(fetchLive, LIVE_POLL_MS);
+
+    return () => {
+      clearInterval(historicalId);
+      clearInterval(liveId);
+    };
+  }, [fetchHistorical, fetchLive]);
+
+  // ── manual refresh ────────────────────────────────────────────────────────
+
+  const refresh = useCallback(() => {
+    fetchHistorical();
+    fetchLive();
+  }, [fetchHistorical, fetchLive]);
+
+  return {
+    utilizationData,
+    revenueSeries,
+    cohortData,
+    liveData,
+    lastUpdated,
+    isLoading,
+    error,
+    refresh,
+  };
 }
